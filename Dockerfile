@@ -4,13 +4,14 @@ WORKDIR /app
 
 ENV TZ=Europe/Moscow
 ENV PYTHONUNBUFFERED=1
+ENV PORT=3000
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+COPY . .
 
-RUN mkdir -p /app/data/webhooks
+RUN mkdir -p /app/data
 
 EXPOSE 3000
 
