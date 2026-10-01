@@ -1,7 +1,7 @@
 # api_client.py
 # ============================================================
 # APIClient для MAX API
-# Основан на рабочем коде из vtb-bot
+# v2: убрано автоматическое добавление минуса к chat_id
 # ============================================================
 
 import json
@@ -26,10 +26,6 @@ class APIClient:
     # ============================================================
     def upload_file(self, file_bytes: bytes, filename: str = "file.bin",
                     file_type: str = "image"):
-        """
-        Загружает файл в MAX.
-        Возвращает token или None.
-        """
         if not self.token:
             logger.error("❌ upload_file: нет токена")
             return None
@@ -76,12 +72,10 @@ class APIClient:
                 if ur.status_code not in (200, 201, 204):
                     logger.error(f"❌ Шаг 2 (multipart): {ur.status_code} - {ur.text[:300]}")
 
-                # Токен для видео берём из Шага 1
                 if token_from_step1:
                     logger.info(f"✅ Токен видео (из Шага 1): {str(token_from_step1)[:30]}...")
                     return token_from_step1
 
-                # Резерв — ищем токен в ответе Шага 2
                 try:
                     result = ur.json()
                     logger.info(
@@ -155,13 +149,15 @@ class APIClient:
             return None
 
     # ============================================================
-    # Отправка поста в канал / группу
+    # Отправка поста
     # ============================================================
     def send_post(self, chat_id, text, media_tokens, media_types=None,
                   retry_not_ready=True, max_retries=12):
         """
         Отправляет пост с медиа.
-        Возвращает (success: bool, post_link: str | None).
+        chat_id передаётся КАК ЕСТЬ — без добавления минуса.
+        Для групп/каналов MAX сам ожидает отрицательный ID,
+        для диалогов — положительный.
         """
         if not self.token:
             return False, None
@@ -181,14 +177,14 @@ class APIClient:
             if attachments:
                 payload["attachments"] = attachments
 
+            # ВАЖНО: НЕ добавляем минус, передаём как есть
             chat_id_str = str(chat_id)
-            chat_id_for_api = chat_id_str if chat_id_str.startswith("-") else f"-{chat_id_str}"
 
             has_video = "video" in media_types
 
             for attempt in range(1, max_retries + 1):
                 logger.info(
-                    f"📤 Отправка в {chat_id_for_api} "
+                    f"📤 Отправка в {chat_id_str} "
                     f"(попытка {attempt}/{max_retries}), "
                     f"медиа: {len(attachments)} ({media_types})"
                 )
@@ -199,7 +195,7 @@ class APIClient:
                         "Authorization": self.token,
                         "Content-Type": "application/json",
                     },
-                    params={"chat_id": chat_id_for_api},
+                    params={"chat_id": chat_id_str},
                     json=payload,
                     timeout=120,
                     verify=False,
@@ -252,13 +248,11 @@ class APIClient:
     # Настройка вебхука
     # ============================================================
     def setup_webhook(self, webhook_url: str) -> bool:
-        """Регистрирует вебхук в MAX."""
         if not self.token:
             return False
 
         headers = {"Authorization": self.token, "Content-Type": "application/json"}
 
-        # Удаляем старые подписки
         try:
             r = requests.get(
                 f"{self.base_url}/subscriptions",
@@ -278,7 +272,6 @@ class APIClient:
         except Exception as e:
             logger.warning(f"⚠️ Не удалось получить старые подписки: {e}")
 
-        # Регистрируем новую
         try:
             r = requests.post(
                 f"{self.base_url}/subscriptions",
