@@ -1,6 +1,6 @@
 # app.py
 # ============================================================
-# max-reposter — Flask-сервер + webhook MAX
+# max-reposter — Flask + webhook MAX + админка
 # ============================================================
 
 import os
@@ -23,13 +23,20 @@ import requests
 from config import (
     TOKEN, BASE_URL, PUBLIC_URL, DATA_DIR,
     SOURCE_CHAT_IDS, TARGET_CHANNEL_ID, TRIGGER_PHRASES,
-    DEDUP_DB, LOG_LEVEL, SEND_INTERVAL_SECONDS,
+    DEDUP_DB, ADMIN_DB, LOG_LEVEL, SEND_INTERVAL_SECONDS,
+    ADMIN_USER, ADMIN_PASS,
 )
 from api_client import APIClient
 from dedup import Dedup
 from media_downloader import MediaDownloader
 from queue_manager import QueueManager
 from reposter import Reposter
+from admin_db import AdminDB
+from auth import require_admin
+from admin_templates import (
+    admin_index_html, admin_repost_detail_html,
+    admin_settings_html, admin_blacklist_html,
+)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -46,6 +53,9 @@ app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 if not TOKEN:
     logger.error("❌ ТОКЕН НЕ НАЙДЕН! Проверь MAX_TOKEN в Bothost")
 
+if not ADMIN_PASS:
+    logger.warning("⚠️ ADMIN_PASS не задан — админка открыта без пароля!")
+
 # ============================================================
 # Инициализация
 # ============================================================
@@ -53,9 +63,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 api = APIClient(token=TOKEN, base_url=BASE_URL)
 dedup = Dedup(DEDUP_DB)
+admin_db = AdminDB(ADMIN_DB)
 downloader = MediaDownloader()
 queue = QueueManager(api, send_interval=SEND_INTERVAL_SECONDS)
-reposter = Reposter(api, downloader, queue, dedup)
+reposter = Reposter(api, downloader, queue, dedup, admin_db)
 
 
 # ============================================================
@@ -66,7 +77,7 @@ reposter = Reposter(api, downloader, queue, dedup)
 def index():
     if request.method == "POST":
         return webhook()
-    return redirect("/debug")
+    return redirect("/admin")
 
 
 @app.route("/webhook", methods=["POST"])
@@ -85,89 +96,101 @@ def webhook():
 
 
 # ============================================================
-# DEBUG UI
+# АДМИНКА
 # ============================================================
 
-DEBUG_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>max-reposter — статус</title>
-    <style>
-        body { font-family: Arial; max-width: 1200px; margin: 30px auto; padding: 20px; background: #f5f5f5; }
-        .card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-        h1 { margin-top: 0; }
-        .btn { display: inline-block; padding: 10px 18px; background: #007bff; color: white; border-radius: 5px; text-decoration: none; margin-right: 8px; margin-bottom: 8px; }
-        .btn-green { background: #28a745; }
-        .btn:hover { opacity: 0.9; }
-        .badge { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 12px; color: white; background: #28a745; }
-        .badge-red { background: #dc3545; }
-        code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; }
-        .list { columns: 2; column-gap: 30px; }
-        .list code { display: block; margin-bottom: 5px; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>🤖 max-reposter</h1>
-        <p>Токен MAX: <b>{{ '✅ есть' if token_set else '❌ НЕТ' }}</b></p>
-        <p>В очереди на отправку: <b>{{ queue_size }}</b></p>
-        <p>Обработано сообщений (dedup): <b>{{ dedup_count }}</b></p>
-    </div>
+@app.route("/admin")
+@require_admin
+def admin_page():
+    status = request.args.get("status")
+    recent = admin_db.get_reposts(limit=100, status=status)
+    stats = admin_db.get_stats()
 
-    <div class="card">
-        <h2>📥 Группы-источники ({{ source_count }})</h2>
-        <div class="list">
-            {% for cid in sources %}
-            <code>{{ cid }}</code>
-            {% endfor %}
-        </div>
-    </div>
-
-    <div class="card">
-        <h2>📤 Целевой канал</h2>
-        <code>{{ target }}</code>
-    </div>
-
-    <div class="card">
-        <h2>🔎 Фильтр по фразам</h2>
-        {% for p in triggers %}
-        <code>{{ p }}</code>
-        {% endfor %}
-    </div>
-
-    <div class="card">
-        <h2>⚙️ Действия</h2>
-        <a href="/setup_webhook" class="btn btn-green">🔗 Настроить вебхук</a>
-        <a href="/debug" class="btn">🔄 Обновить</a>
-    </div>
-</body>
-</html>
-"""
-
-
-@app.route("/debug")
-def debug_page():
+    # Считаем blacklist
+    import sqlite3
     try:
-        dedup_count = 0
-        import sqlite3
-        conn = sqlite3.connect(DEDUP_DB)
-        dedup_count = conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
+        conn = sqlite3.connect(ADMIN_DB)
+        bl_count = conn.execute("SELECT COUNT(*) FROM blacklist").fetchone()[0]
         conn.close()
     except Exception:
-        dedup_count = 0
+        bl_count = 0
 
-    return render_template_string(
-        DEBUG_PAGE,
-        token_set=bool(TOKEN),
-        source_count=len(SOURCE_CHAT_IDS),
-        sources=sorted(SOURCE_CHAT_IDS),
+    return admin_index_html(
+        stats=stats,
+        recent=recent,
+        sources=SOURCE_CHAT_IDS,
         target=TARGET_CHANNEL_ID,
         triggers=TRIGGER_PHRASES,
-        queue_size=queue.q.qsize(),
-        dedup_count=dedup_count,
+        blacklist_count=bl_count,
     )
+
+
+@app.route("/admin/repost/<path:mid>")
+@require_admin
+def admin_repost_detail(mid):
+    items = admin_db.get_reposts(limit=1)
+    # Найдём по mid
+    import sqlite3
+    conn = sqlite3.connect(ADMIN_DB)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM reposted WHERE mid = ?", (mid,)).fetchone()
+    conn.close()
+    if not row:
+        return "❌ Не найдено", 404
+    return admin_repost_detail_html(dict(row))
+
+
+@app.route("/admin/settings")
+@require_admin
+def admin_settings():
+    return admin_settings_html(
+        sources=SOURCE_CHAT_IDS,
+        target=TARGET_CHANNEL_ID,
+        triggers=TRIGGER_PHRASES,
+    )
+
+
+@app.route("/admin/blacklist")
+@require_admin
+def admin_blacklist():
+    import sqlite3
+    conn = sqlite3.connect(ADMIN_DB)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM blacklist ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return admin_blacklist_html([dict(r) for r in rows])
+
+
+@app.route("/admin/blacklist/add/<path:mid>")
+@require_admin
+def admin_blacklist_add(mid):
+    admin_db.blacklist_add(mid, reason="manual")
+    return redirect("/admin")
+
+
+@app.route("/admin/blacklist/remove/<path:mid>")
+@require_admin
+def admin_blacklist_remove(mid):
+    import sqlite3
+    conn = sqlite3.connect(ADMIN_DB)
+    conn.execute("DELETE FROM blacklist WHERE mid = ?", (mid,))
+    conn.commit()
+    conn.close()
+    return redirect("/admin/blacklist")
+
+
+@app.route("/admin/delete/<path:mid>")
+@require_admin
+def admin_delete(mid):
+    admin_db.delete_repost(mid)
+    return redirect("/admin")
+
+
+@app.route("/admin/cleanup_history")
+@require_admin
+def admin_cleanup_history():
+    admin_db.cleanup_old(days=90)
+    return redirect("/admin/settings")
 
 
 # ============================================================
@@ -179,22 +202,59 @@ def setup_webhook():
     webhook_url = f"{PUBLIC_URL}/webhook"
     ok = api.setup_webhook(webhook_url)
     if ok:
-        return redirect("/debug")
-    return f"❌ Не удалось настроить вебхук. Проверь логи.", 500
+        return redirect("/admin")
+    return "❌ Не удалось настроить вебхук. Проверь логи.", 500
 
 
 # ============================================================
-# Health-check
+# Debug / Health
 # ============================================================
+
+@app.route("/debug")
+def debug_page():
+    import sqlite3
+    try:
+        conn = sqlite3.connect(DEDUP_DB)
+        dedup_count = conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
+        conn.close()
+    except Exception:
+        dedup_count = 0
+
+    stats = admin_db.get_stats()
+
+    return f"""
+    <!DOCTYPE html><html><head><meta charset="UTF-8">
+    <title>Debug</title>
+    <style>body{{font-family:Arial;max-width:800px;margin:30px auto;padding:20px;background:#f5f5f5}}
+    .card{{background:white;padding:20px;border-radius:8px;margin-bottom:20px;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
+    .btn{{display:inline-block;padding:10px 18px;background:#007bff;color:white;border-radius:5px;text-decoration:none;margin-right:8px}}
+    code{{background:#f0f0f0;padding:2px 6px;border-radius:3px}}</style>
+    </head><body>
+    <div class="card">
+        <h1>🐛 Debug</h1>
+        <p>Токен: <b>{'✅' if TOKEN else '❌'}</b></p>
+        <p>Обработано (dedup): <b>{dedup_count}</b></p>
+        <p>Всего пересылок: <b>{stats['total']}</b></p>
+        <p>Успешных: <b>{stats['success']}</b>, ошибок: <b>{stats['errors']}</b></p>
+        <p>В очереди: <b>{queue.q.qsize()}</b></p>
+        <a href="/admin" class="btn">⚙️ Админка</a>
+        <a href="/setup_webhook" class="btn">🔗 Вебхук</a>
+        <a href="/debug" class="btn">🔄 Обновить</a>
+    </div>
+    </body></html>
+    """
+
 
 @app.route("/health")
 def health():
+    stats = admin_db.get_stats()
     return {
         "status": "ok",
         "token_set": bool(TOKEN),
         "sources": len(SOURCE_CHAT_IDS),
         "target": TARGET_CHANNEL_ID,
         "queue": queue.q.qsize(),
+        "stats": stats,
     }
 
 
@@ -209,6 +269,7 @@ if __name__ == "__main__":
     logger.info(f"   Групп-источников: {len(SOURCE_CHAT_IDS)}")
     logger.info(f"   Целевой канал: {TARGET_CHANNEL_ID}")
     logger.info(f"   Фильтров: {len(TRIGGER_PHRASES)}")
+    logger.info(f"   Админ: {ADMIN_USER}, пароль: {'✅' if ADMIN_PASS else '❌'}")
 
     # Автонастройка вебхука
     if TOKEN:
