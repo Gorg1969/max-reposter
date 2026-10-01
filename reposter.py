@@ -1,6 +1,7 @@
 # reposter.py
 # ============================================================
-# Главная логика: извлечение контента → фильтр → скачивание → отправка
+# Главная логика: извлечение → фильтр → скачивание → отправка
+# с записью в AdminDB
 # ============================================================
 
 import logging
@@ -17,15 +18,13 @@ logger = logging.getLogger(__name__)
 
 
 class Reposter:
-    def __init__(self, api, downloader, queue, dedup):
+    def __init__(self, api, downloader, queue, dedup, admin_db):
         self.api = api
         self.downloader = downloader
         self.queue = queue
         self.dedup = dedup
+        self.admin_db = admin_db
 
-    # ============================================================
-    # Обработка входящего вебхука
-    # ============================================================
     def on_message_created(self, update: dict):
         try:
             msg = update.get("message", {}) or {}
@@ -34,14 +33,24 @@ class Reposter:
 
             chat_id = str(recipient.get("chat_id", ""))
             if chat_id not in SOURCE_CHAT_IDS:
-                return  # не наша группа
+                return
 
             # Извлекаем контент
             text, attachments, markup = self._extract_content(msg)
 
-            # Дедуп
+            # Определяем mid
             mid = body.get("mid") or msg.get("link", {}).get("message", {}).get("mid")
-            if not mid or self.dedup.seen(mid):
+            if not mid:
+                return
+
+            # Дедуп
+            if self.dedup.seen(mid):
+                return
+
+            # Чёрный список
+            if self.admin_db.blacklist_has(mid):
+                logger.info(f"🚫 mid в чёрном списке: {mid}")
+                self.dedup.mark(mid)
                 return
 
             # Фильтр по фразе
@@ -50,8 +59,18 @@ class Reposter:
                 return
 
             logger.info(
-                f"🎯 Найдено объявление! mid={mid}, "
+                f"🎯 Объявление! mid={mid}, "
                 f"text={len(text)} симв., медиа={len(attachments)}"
+            )
+
+            # Запись в историю со статусом pending
+            self.admin_db.add_repost(
+                mid=mid,
+                source_chat_id=chat_id,
+                target_chat_id=TARGET_CHANNEL_ID,
+                text_preview=text,
+                media_count=len(attachments),
+                status="pending",
             )
 
             # Скачиваем + загружаем медиа
@@ -60,8 +79,11 @@ class Reposter:
             # Собираем HTML со ссылками
             html_text = build_html_text(text, markup)
 
-            # В очередь
-            self.queue.enqueue(TARGET_CHANNEL_ID, html_text, tokens, types)
+            # В очередь (с mid, чтобы потом обновить статус)
+            self.queue.enqueue(
+                TARGET_CHANNEL_ID, html_text, tokens, types,
+                mid=mid, admin_db=self.admin_db
+            )
 
             # Помечаем как обработанное
             self.dedup.mark(mid)
@@ -69,39 +91,27 @@ class Reposter:
         except Exception as e:
             logger.exception(f"❌ on_message_created: {e}")
 
-    # ============================================================
-    # Извлечение текста / медиа / markup
-    # ============================================================
     def _extract_content(self, msg: dict):
-        """
-        Если сообщение — пересылка (link.type == "forward"),
-        берём данные из link.message. Иначе — из body.
-        """
         link = msg.get("link") or {}
-
         if link.get("type") == "forward":
             inner = link.get("message") or {}
-            text = inner.get("text", "") or ""
-            attachments = inner.get("attachments", []) or []
-            markup = inner.get("markup", []) or []
-            return text, attachments, markup
-
+            return (
+                inner.get("text", "") or "",
+                inner.get("attachments", []) or [],
+                inner.get("markup", []) or [],
+            )
         body = msg.get("body") or {}
-        text = body.get("text", "") or ""
-        attachments = body.get("attachments", []) or []
-        return text, attachments, []
+        return (
+            body.get("text", "") or "",
+            body.get("attachments", []) or [],
+            [],
+        )
 
-    # ============================================================
-    # Проверка фильтра по фразе
-    # ============================================================
     def _match_trigger(self, text: str) -> bool:
         if not text:
             return False
         return any(phrase in text for phrase in TRIGGER_PHRASES)
 
-    # ============================================================
-    # Скачивание + загрузка медиа заново
-    # ============================================================
     def _reupload_media(self, attachments: list):
         tokens = []
         types = []
@@ -115,17 +125,16 @@ class Reposter:
             url = payload.get("url")
 
             if not url:
-                logger.warning(f"⚠️ Нет url в attachment типа {att_type}, пропускаем")
+                logger.warning(f"⚠️ Нет url в attachment типа {att_type}")
                 continue
 
-            # MAX понимает типы: image / video
             if att_type not in ("image", "video"):
-                logger.warning(f"⚠️ Неизвестный тип вложения: {att_type}")
+                logger.warning(f"⚠️ Неизвестный тип: {att_type}")
                 continue
 
             file_bytes = self.downloader.download(url)
             if not file_bytes:
-                logger.error(f"❌ Не удалось скачать {att_type}: {url[:80]}")
+                logger.error(f"❌ Не удалось скачать {att_type}")
                 continue
 
             token = self.api.upload_file(
