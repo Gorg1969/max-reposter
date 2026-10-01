@@ -13,7 +13,6 @@ BASE_URL = "https://platform-api2.max.ru"
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://maxbot.bothost.tech")
 
 # ============ ГРУППЫ-ИСТОЧНИКИ ============
-# Слушаем новые сообщения из этих групп
 SOURCE_CHAT_IDS = {
     "-73112487086609",  # ИЗТ-админ
     "-69959827081745",  # ТЯГАЧИ
@@ -32,19 +31,23 @@ SOURCE_CHAT_IDS = {
 TARGET_CHANNEL_ID = "-78837970191096"
 
 # ============ ФИЛЬТР ПО ТЕКСТУ ============
-# Пересылаем только сообщения, в которых есть хотя бы одна из этих фраз
 TRIGGER_PHRASES = [
     "За покупкой и согласованием скидки обращайтесь",
 ]
 
 # ============ ЛИМИТЫ ============
-MAX_MEDIA_PER_POST = 10       # MAX разрешает до 10 вложений
-SEND_INTERVAL_SECONDS = 0.6   # ~2 сообщения в секунду (лимит MAX)
-VIDEO_PROCESS_WAIT = 60       # секунд ожидания обработки видео на стороне MAX
+MAX_MEDIA_PER_POST = 10
+SEND_INTERVAL_SECONDS = 0.6
+VIDEO_PROCESS_WAIT = 60
 
 # ============ ДАННЫЕ ============
 DATA_DIR = "/app/data"
 DEDUP_DB = os.path.join(DATA_DIR, "dedup.db")
+ADMIN_DB = os.path.join(DATA_DIR, "admin.db")
+
+# ============ АДМИНКА ============
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "")  # если пусто — авторизация отключена
 
 # ============ ЛОГИРОВАНИЕ ============
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
