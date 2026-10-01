@@ -1,6 +1,7 @@
 # app.py
 # ============================================================
-# max-reposter — Flask + webhook MAX + админка
+# max-reposter — Flask + webhook MAX + админка + команды бота
+# Версия с расширенным логированием вебхука
 # ============================================================
 
 import os
@@ -70,7 +71,86 @@ reposter = Reposter(api, downloader, queue, dedup, admin_db)
 
 
 # ============================================================
-# WEBHOOK
+# КОМАНДЫ БОТА (личные сообщения)
+# ============================================================
+
+def handle_bot_command(user_id: int, text: str) -> bool:
+    """
+    Обрабатывает команды бота.
+    Возвращает True, если команда распознана.
+    """
+    cmd = (text or "").strip().lower()
+
+    if cmd == "/start":
+        stats = admin_db.get_stats()
+        api.send_post(
+            user_id,
+            "🤖 **max-reposter**\n\n"
+            "Бот слушает 11 групп и пересылает объявления в канал.\n\n"
+            f"📊 Всего пересылок: **{stats['total']}**\n"
+            f"✅ Успешно: **{stats['success']}**\n"
+            f"❌ Ошибок: **{stats['errors']}**\n"
+            f"📅 Сегодня: **{stats['today']}**\n\n"
+            "🔗 **Админка:**\n"
+            f"{PUBLIC_URL}/admin\n\n"
+            "**Команды:**\n"
+            "/status — статистика\n"
+            "/myid — ваш user_id\n"
+            "/webhook — статус вебхука\n"
+            "/help — справка\n",
+            [], []
+        )
+        return True
+
+    if cmd == "/status":
+        stats = admin_db.get_stats()
+        api.send_post(
+            user_id,
+            f"📊 **Статус:**\n\n"
+            f"📦 Всего: {stats['total']}\n"
+            f"✅ Успешно: {stats['success']}\n"
+            f"❌ Ошибок: {stats['errors']}\n"
+            f"📅 Сегодня: {stats['today']}\n"
+            f"📥 В очереди: {queue.q.qsize()}\n",
+            [], []
+        )
+        return True
+
+    if cmd == "/myid":
+        api.send_post(
+            user_id,
+            f"🆔 **Ваш user_id:** `{user_id}`",
+            [], []
+        )
+        return True
+
+    if cmd == "/webhook":
+        api.send_post(
+            user_id,
+            f"🔗 **Webhook URL:**\n{PUBLIC_URL}/webhook\n\n"
+            f"Для перерегистрации откройте:\n{PUBLIC_URL}/setup_webhook\n",
+            [], []
+        )
+        return True
+
+    if cmd == "/help":
+        api.send_post(
+            user_id,
+            "🆘 **Справка**\n\n"
+            "/start — главное меню\n"
+            "/status — статистика\n"
+            "/myid — ваш user_id\n"
+            "/webhook — статус вебхука\n\n"
+            f"🌐 Админка: {PUBLIC_URL}/admin\n",
+            [], []
+        )
+        return True
+
+    return False
+
+
+# ============================================================
+# WEBHOOK — с расширенным логированием
 # ============================================================
 
 @app.route("/", methods=["GET", "POST"])
@@ -86,7 +166,55 @@ def webhook():
         data = request.get_json(silent=True) or {}
         update_type = data.get("update_type")
 
+        # ============ ПОДРОБНОЕ ЛОГИРОВАНИЕ ============
+        logger.info("=" * 70)
+        logger.info(f"📩 WEBHOOK ПОЛУЧЕН")
+        logger.info(f"📩 update_type = {update_type}")
+        logger.info(f"📩 FULL JSON:")
+        logger.info(json.dumps(data, ensure_ascii=False, indent=2))
+        logger.info("=" * 70)
+
         if update_type == "message_created":
+            msg = data.get("message", {}) or {}
+            recipient = msg.get("recipient", {}) or {}
+            sender = msg.get("sender", {}) or {}
+            body = msg.get("body", {}) or {}
+            link = msg.get("link", {}) or {}
+
+            chat_id = str(recipient.get("chat_id", ""))
+            chat_type = recipient.get("chat_type", "")
+            user_id = sender.get("user_id")
+            text = (body.get("text") or "").strip()
+            mid = body.get("mid")
+
+            logger.info(f"📩 РАЗБОР:")
+            logger.info(f"    chat_id     = {chat_id}  (тип: {chat_type})")
+            logger.info(f"    user_id     = {user_id}")
+            logger.info(f"    mid         = {mid}")
+            logger.info(f"    text        = {text[:200]}")
+            logger.info(f"    link.type   = {link.get('type')}")
+            logger.info(f"    attachemnts = {len(body.get('attachments') or [])}")
+
+            # ==== ПРОВЕРКА: личное сообщение? ====
+            is_private = (user_id and chat_id and chat_id == str(user_id))
+            logger.info(f"    is_private  = {is_private}")
+
+            if is_private:
+                logger.info(f"🤖 ЛИЧНАЯ КОМАНДА: text='{text}'")
+                if handle_bot_command(user_id, text):
+                    logger.info(f"    ✅ команда обработана")
+                    return jsonify({"ok": True}), 200
+                else:
+                    logger.info(f"    ⚠️ команда не распознана")
+
+            # ==== ПРОВЕРКА: из группы-источника? ====
+            in_sources = chat_id in SOURCE_CHAT_IDS
+            logger.info(f"    in_sources  = {in_sources}")
+            if not in_sources:
+                logger.info(f"    ⏭️ chat_id {chat_id} НЕ в списке источников")
+                logger.info(f"       Источники: {sorted(SOURCE_CHAT_IDS)}")
+
+            logger.info(f"📨 Передаю в reposter...")
             reposter.on_message_created(data)
 
         return jsonify({"ok": True}), 200
@@ -106,7 +234,6 @@ def admin_page():
     recent = admin_db.get_reposts(limit=100, status=status)
     stats = admin_db.get_stats()
 
-    # Считаем blacklist
     import sqlite3
     try:
         conn = sqlite3.connect(ADMIN_DB)
@@ -128,8 +255,6 @@ def admin_page():
 @app.route("/admin/repost/<path:mid>")
 @require_admin
 def admin_repost_detail(mid):
-    items = admin_db.get_reposts(limit=1)
-    # Найдём по mid
     import sqlite3
     conn = sqlite3.connect(ADMIN_DB)
     conn.row_factory = sqlite3.Row
@@ -271,7 +396,6 @@ if __name__ == "__main__":
     logger.info(f"   Фильтров: {len(TRIGGER_PHRASES)}")
     logger.info(f"   Админ: {ADMIN_USER}, пароль: {'✅' if ADMIN_PASS else '❌'}")
 
-    # Автонастройка вебхука
     if TOKEN:
         try:
             api.setup_webhook(f"{PUBLIC_URL}/webhook")
