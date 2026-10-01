@@ -1,7 +1,7 @@
 # api_client.py
 # ============================================================
 # APIClient для MAX API
-# v2: убрано автоматическое добавление минуса к chat_id
+# v3: добавлены отладочные методы get_subscriptions_raw / get_me_raw
 # ============================================================
 
 import json
@@ -156,8 +156,6 @@ class APIClient:
         """
         Отправляет пост с медиа.
         chat_id передаётся КАК ЕСТЬ — без добавления минуса.
-        Для групп/каналов MAX сам ожидает отрицательный ID,
-        для диалогов — положительный.
         """
         if not self.token:
             return False, None
@@ -177,9 +175,7 @@ class APIClient:
             if attachments:
                 payload["attachments"] = attachments
 
-            # ВАЖНО: НЕ добавляем минус, передаём как есть
             chat_id_str = str(chat_id)
-
             has_video = "video" in media_types
 
             for attempt in range(1, max_retries + 1):
@@ -278,11 +274,19 @@ class APIClient:
                 headers=headers,
                 json={
                     "url": webhook_url,
-                    "update_types": ["message_created", "bot_started", "bot_stopped"],
+                    "update_types": [
+                        "message_created",
+                        "message_callback",
+                        "bot_started",
+                        "bot_stopped",
+                        "bot_added",
+                        "bot_removed",
+                    ],
                 },
                 timeout=30,
                 verify=False,
             )
+            logger.info(f"📨 SUBSCRIBE RESPONSE: {r.status_code} {r.text[:500]}")
             if r.status_code == 200:
                 logger.info(f"✅ Вебхук зарегистрирован: {webhook_url}")
                 return True
@@ -291,3 +295,32 @@ class APIClient:
         except Exception as e:
             logger.exception(f"❌ setup_webhook: {e}")
             return False
+
+    # ============================================================
+    # ОТЛАДКА
+    # ============================================================
+    def get_subscriptions_raw(self):
+        if not self.token:
+            return {"error": "no token"}
+        try:
+            r = requests.get(
+                f"{self.base_url}/subscriptions",
+                headers={"Authorization": self.token},
+                timeout=30, verify=False,
+            )
+            return {"status": r.status_code, "body": r.text}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_me_raw(self):
+        if not self.token:
+            return {"error": "no token"}
+        try:
+            r = requests.get(
+                f"{self.base_url}/me",
+                headers={"Authorization": self.token},
+                timeout=30, verify=False,
+            )
+            return {"status": r.status_code, "body": r.text}
+        except Exception as e:
+            return {"error": str(e)}
