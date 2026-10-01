@@ -1,7 +1,7 @@
 # app.py
 # ============================================================
 # max-reposter — Flask + webhook MAX + админка + команды бота
-# Версия с расширенным логированием вебхука
+# v3: правильная обработка личных диалогов (chat_type = "dialog")
 # ============================================================
 
 import os
@@ -71,20 +71,24 @@ reposter = Reposter(api, downloader, queue, dedup, admin_db)
 
 
 # ============================================================
-# КОМАНДЫ БОТА (личные сообщения)
+# КОМАНДЫ БОТА
 # ============================================================
 
-def handle_bot_command(user_id: int, text: str) -> bool:
+def handle_bot_command(dialog_chat_id: int, user_id: int, text: str) -> bool:
     """
-    Обрабатывает команды бота.
-    Возвращает True, если команда распознана.
+    Обрабатывает команды в личном диалоге.
+    Ответ отправляем на dialog_chat_id (chat_id диалога),
+    а не на user_id.
     """
     cmd = (text or "").strip().lower()
 
+    # Отправляем ответ в диалог
+    def reply(msg):
+        return api.send_post(dialog_chat_id, msg, [], [])
+
     if cmd == "/start":
         stats = admin_db.get_stats()
-        api.send_post(
-            user_id,
+        reply(
             "🤖 **max-reposter**\n\n"
             "Бот слушает 11 групп и пересылает объявления в канал.\n\n"
             f"📊 Всего пересылок: **{stats['total']}**\n"
@@ -97,52 +101,41 @@ def handle_bot_command(user_id: int, text: str) -> bool:
             "/status — статистика\n"
             "/myid — ваш user_id\n"
             "/webhook — статус вебхука\n"
-            "/help — справка\n",
-            [], []
+            "/help — справка"
         )
         return True
 
     if cmd == "/status":
         stats = admin_db.get_stats()
-        api.send_post(
-            user_id,
+        reply(
             f"📊 **Статус:**\n\n"
             f"📦 Всего: {stats['total']}\n"
             f"✅ Успешно: {stats['success']}\n"
             f"❌ Ошибок: {stats['errors']}\n"
             f"📅 Сегодня: {stats['today']}\n"
-            f"📥 В очереди: {queue.q.qsize()}\n",
-            [], []
+            f"📥 В очереди: {queue.q.qsize()}"
         )
         return True
 
     if cmd == "/myid":
-        api.send_post(
-            user_id,
-            f"🆔 **Ваш user_id:** `{user_id}`",
-            [], []
-        )
+        reply(f"🆔 **Ваш user_id:** `{user_id}`\n💬 **chat_id диалога:** `{dialog_chat_id}`")
         return True
 
     if cmd == "/webhook":
-        api.send_post(
-            user_id,
+        reply(
             f"🔗 **Webhook URL:**\n{PUBLIC_URL}/webhook\n\n"
-            f"Для перерегистрации откройте:\n{PUBLIC_URL}/setup_webhook\n",
-            [], []
+            f"Перерегистрация:\n{PUBLIC_URL}/setup_webhook"
         )
         return True
 
     if cmd == "/help":
-        api.send_post(
-            user_id,
+        reply(
             "🆘 **Справка**\n\n"
             "/start — главное меню\n"
             "/status — статистика\n"
             "/myid — ваш user_id\n"
             "/webhook — статус вебхука\n\n"
-            f"🌐 Админка: {PUBLIC_URL}/admin\n",
-            [], []
+            f"🌐 Админка: {PUBLIC_URL}/admin"
         )
         return True
 
@@ -150,7 +143,7 @@ def handle_bot_command(user_id: int, text: str) -> bool:
 
 
 # ============================================================
-# WEBHOOK — с расширенным логированием
+# WEBHOOK
 # ============================================================
 
 @app.route("/", methods=["GET", "POST"])
@@ -166,56 +159,46 @@ def webhook():
         data = request.get_json(silent=True) or {}
         update_type = data.get("update_type")
 
-        # ============ ПОДРОБНОЕ ЛОГИРОВАНИЕ ============
-        logger.info("=" * 70)
-        logger.info(f"📩 WEBHOOK ПОЛУЧЕН")
-        logger.info(f"📩 update_type = {update_type}")
-        logger.info(f"📩 FULL JSON:")
-        logger.info(json.dumps(data, ensure_ascii=False, indent=2))
-        logger.info("=" * 70)
-
         if update_type == "message_created":
             msg = data.get("message", {}) or {}
             recipient = msg.get("recipient", {}) or {}
             sender = msg.get("sender", {}) or {}
             body = msg.get("body", {}) or {}
-            link = msg.get("link", {}) or {}
 
-            chat_id = str(recipient.get("chat_id", ""))
+            chat_id = recipient.get("chat_id")
             chat_type = recipient.get("chat_type", "")
             user_id = sender.get("user_id")
             text = (body.get("text") or "").strip()
-            mid = body.get("mid")
 
-            logger.info(f"📩 РАЗБОР:")
-            logger.info(f"    chat_id     = {chat_id}  (тип: {chat_type})")
-            logger.info(f"    user_id     = {user_id}")
-            logger.info(f"    mid         = {mid}")
-            logger.info(f"    text        = {text[:200]}")
-            logger.info(f"    link.type   = {link.get('type')}")
-            logger.info(f"    attachemnts = {len(body.get('attachments') or [])}")
+            logger.info("=" * 70)
+            logger.info(f"📩 WEBHOOK message_created")
+            logger.info(f"    chat_type = {chat_type}")
+            logger.info(f"    chat_id   = {chat_id}")
+            logger.info(f"    user_id   = {user_id}")
+            logger.info(f"    text      = {text[:200]}")
 
-            # ==== ПРОВЕРКА: личное сообщение? ====
-            is_private = (user_id and chat_id and chat_id == str(user_id))
-            logger.info(f"    is_private  = {is_private}")
-
-            if is_private:
-                logger.info(f"🤖 ЛИЧНАЯ КОМАНДА: text='{text}'")
-                if handle_bot_command(user_id, text):
+            # ============ ЛИЧНЫЙ ДИАЛОГ ============
+            if chat_type == "dialog":
+                logger.info(f"🤖 ЛИЧНЫЙ ДИАЛОГ, команда='{text}'")
+                if handle_bot_command(chat_id, user_id, text):
                     logger.info(f"    ✅ команда обработана")
-                    return jsonify({"ok": True}), 200
                 else:
                     logger.info(f"    ⚠️ команда не распознана")
+                logger.info("=" * 70)
+                return jsonify({"ok": True}), 200
 
-            # ==== ПРОВЕРКА: из группы-источника? ====
-            in_sources = chat_id in SOURCE_CHAT_IDS
-            logger.info(f"    in_sources  = {in_sources}")
-            if not in_sources:
-                logger.info(f"    ⏭️ chat_id {chat_id} НЕ в списке источников")
-                logger.info(f"       Источники: {sorted(SOURCE_CHAT_IDS)}")
+            # ============ ГРУППА-ИСТОЧНИК ============
+            chat_id_str = str(chat_id)
+            in_sources = chat_id_str in SOURCE_CHAT_IDS
+            logger.info(f"    in_sources = {in_sources}")
 
-            logger.info(f"📨 Передаю в reposter...")
-            reposter.on_message_created(data)
+            if in_sources:
+                logger.info(f"📨 Передаю в reposter...")
+                reposter.on_message_created(data)
+            else:
+                logger.info(f"    ⏭️ не из источников")
+
+            logger.info("=" * 70)
 
         return jsonify({"ok": True}), 200
     except Exception as e:
