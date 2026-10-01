@@ -215,4 +215,6 @@ if __name__ == "__main__":
         try:
             api.setup_webhook(f"{PUBLIC_URL}/webhook")
         except Exception as e:
-            logger.warning(f"⚠️
+            logger.warning(f"⚠️ Не удалось настроить вебхук при старте: {e}")
+
+    app.run(host="0.0.0.0", port=port, threaded=True)
