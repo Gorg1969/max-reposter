@@ -1,7 +1,7 @@
 # app.py
 # ============================================================
 # max-reposter — Flask + webhook MAX + админка + команды бота
-# v4: добавлены эндпоинты /test_subs и /test_me, логирование RAW
+# v4: диагностика вебхука + нормализация chat_id
 # ============================================================
 
 import os
@@ -16,6 +16,7 @@ import json
 import logging
 import urllib3
 from datetime import datetime
+from collections import deque
 
 from flask import Flask, request, jsonify, redirect, render_template_string
 
@@ -25,7 +26,7 @@ from config import (
     TOKEN, BASE_URL, PUBLIC_URL, DATA_DIR,
     SOURCE_CHAT_IDS, TARGET_CHANNEL_ID, TRIGGER_PHRASES,
     DEDUP_DB, ADMIN_DB, LOG_LEVEL, SEND_INTERVAL_SECONDS,
-    ADMIN_USER, ADMIN_PASS,
+    ADMIN_USER, ADMIN_PASS, is_source_chat,
 )
 from api_client import APIClient
 from dedup import Dedup
@@ -58,6 +59,11 @@ if not ADMIN_PASS:
     logger.warning("⚠️ ADMIN_PASS не задан — админка открыта без пароля!")
 
 # ============================================================
+# Буфер последних входящих вебхуков (для диагностики через /pending_webhooks)
+# ============================================================
+RECENT_WEBHOOKS = deque(maxlen=50)
+
+# ============================================================
 # Инициализация
 # ============================================================
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -75,6 +81,10 @@ reposter = Reposter(api, downloader, queue, dedup, admin_db)
 # ============================================================
 
 def handle_bot_command(dialog_chat_id: int, user_id: int, text: str) -> bool:
+    """
+    Обрабатывает команды в личном диалоге.
+    Ответ отправляем на dialog_chat_id (chat_id диалога).
+    """
     cmd = (text or "").strip().lower()
 
     def reply(msg):
@@ -84,7 +94,7 @@ def handle_bot_command(dialog_chat_id: int, user_id: int, text: str) -> bool:
         stats = admin_db.get_stats()
         reply(
             "🤖 **max-reposter**\n\n"
-            "Бот слушает 11 групп и пересылает объявления в канал.\n\n"
+            "Бот слушает группы и пересылает объявления в канал.\n\n"
             f"📊 Всего пересылок: **{stats['total']}**\n"
             f"✅ Успешно: **{stats['success']}**\n"
             f"❌ Ошибок: **{stats['errors']}**\n"
@@ -119,7 +129,7 @@ def handle_bot_command(dialog_chat_id: int, user_id: int, text: str) -> bool:
         reply(
             f"🔗 **Webhook URL:**\n{PUBLIC_URL}/webhook\n\n"
             f"Перерегистрация:\n{PUBLIC_URL}/setup_webhook\n\n"
-            f"Отладка:\n{PUBLIC_URL}/test_subs\n{PUBLIC_URL}/test_me"
+            f"Диагностика:\n{PUBLIC_URL}/pending_webhooks"
         )
         return True
 
@@ -150,16 +160,29 @@ def index():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # ========== БЕЗУСЛОВНОЕ ЛОГИРОВАНИЕ СЫРОГО ТЕЛА ==========
+    raw_body = ""
+    try:
+        raw_body = request.get_data(as_text=True) or ""
+    except Exception as e:
+        logger.error(f"❌ Не удалось прочитать тело вебхука: {e}")
+
+    logger.info("=" * 70)
+    logger.info(f"🔔 RAW WEBHOOK ({len(raw_body)} байт):")
+    logger.info(raw_body[:3000])
+
+    # Сохраняем в буфер для /pending_webhooks
+    RECENT_WEBHOOKS.append({
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "raw": raw_body[:3000],
+        "headers": dict(request.headers),
+    })
+
     try:
         data = request.get_json(silent=True) or {}
-        logger.info(f"RAW: {json.dumps(data, ensure_ascii=False)}")
-
         update_type = data.get("update_type")
 
-        # -------- bot_added / bot_removed --------
-        if update_type in ("bot_added", "bot_removed"):
-            logger.info(f"🤖 {update_type}: {json.dumps(data, ensure_ascii=False)}")
-            return jsonify({"ok": True}), 200
+        logger.info(f"📩 update_type = {update_type!r}")
 
         if update_type == "message_created":
             msg = data.get("message", {}) or {}
@@ -172,17 +195,26 @@ def webhook():
             user_id = sender.get("user_id")
             text = (body.get("text") or "").strip()
 
-            logger.info("=" * 70)
-            logger.info(f"📩 WEBHOOK message_created")
-            logger.info(f"    chat_type = {chat_type}")
-            logger.info(f"    chat_id   = {chat_id}")
-            logger.info(f"    user_id   = {user_id}")
-            logger.info(f"    text      = {text[:200]}")
+            logger.info(f"    chat_type = {chat_type!r}")
+            logger.info(f"    chat_id   = {chat_id!r} (type={type(chat_id).__name__})")
+            logger.info(f"    user_id   = {user_id!r}")
+            logger.info(f"    text      = {text[:200]!r}")
 
             # ============ ЛИЧНЫЙ ДИАЛОГ ============
-            if chat_type == "dialog":
-                logger.info(f"🤖 ЛИЧНЫЙ ДИАЛОГ, команда='{text}'")
-                if handle_bot_command(chat_id, user_id, text):
+            # MAX может присылать chat_type = "dialog" или "chat" для лички
+            is_dialog = chat_type in ("dialog", "chat") and (
+                chat_id is None or str(chat_id) == str(user_id)
+            )
+            # Дополнительная эвристика: если chat_id отсутствует, но есть user_id
+            if not is_dialog and chat_id is None and user_id is not None:
+                is_dialog = True
+                logger.info("    ⚠️ chat_id отсутствует, но есть user_id — считаем диалогом")
+
+            if is_dialog:
+                logger.info(f"🤖 ЛИЧНЫЙ ДИАЛОГ, команда={text!r}")
+                # Для ответа используем chat_id, если он есть, иначе user_id
+                reply_chat_id = chat_id if chat_id is not None else user_id
+                if handle_bot_command(reply_chat_id, user_id, text):
                     logger.info(f"    ✅ команда обработана")
                 else:
                     logger.info(f"    ⚠️ команда не распознана")
@@ -190,10 +222,8 @@ def webhook():
                 return jsonify({"ok": True}), 200
 
             # ============ ГРУППА-ИСТОЧНИК ============
-            chat_id_str = str(chat_id)
-            in_sources = chat_id_str in SOURCE_CHAT_IDS
-            logger.info(f"    in_sources = {in_sources}")
-            logger.info(f"    SOURCE_CHAT_IDS = {sorted(SOURCE_CHAT_IDS)}")
+            in_sources = is_source_chat(chat_id)
+            logger.info(f"    in_sources = {in_sources} (chat_type={chat_type!r})")
 
             if in_sources:
                 logger.info(f"📨 Передаю в reposter...")
@@ -201,12 +231,120 @@ def webhook():
             else:
                 logger.info(f"    ⏭️ не из источников")
 
-            logger.info("=" * 70)
+        elif update_type == "bot_started":
+            logger.info("🤖 bot_started")
 
+        elif update_type == "bot_stopped":
+            logger.info("🤖 bot_stopped")
+
+        elif update_type == "bot_added":
+            logger.info("🤖 bot_added — бот добавлен в чат!")
+            # Здесь можно сохранять chat_id в БД
+            msg = data.get("message", {}) or {}
+            recipient = msg.get("recipient", {}) or {}
+            new_chat_id = recipient.get("chat_id")
+            new_chat_type = recipient.get("chat_type", "")
+            logger.info(f"    new chat_id = {new_chat_id!r}, type = {new_chat_type!r}")
+            if new_chat_id is not None:
+                admin_db.set_setting(f"discovered_chat_{new_chat_id}", new_chat_type)
+
+        else:
+            logger.info(f"ℹ️ Неизвестный update_type: {update_type!r}")
+
+        logger.info("=" * 70)
         return jsonify({"ok": True}), 200
+
     except Exception as e:
         logger.exception(f"❌ webhook: {e}")
         return jsonify({"ok": False}), 500
+
+
+# ============================================================
+# ДИАГНОСТИКА ВЕБХУКА
+# ============================================================
+
+@app.route("/webhook_raw", methods=["POST"])
+def webhook_raw():
+    """
+    Пустой эндпоинт-эхо. Возвращает 200 на всё,
+    но пишет сырое тело в логи и буфер.
+    Используется для проверки: доходят ли групповые события вообще.
+    """
+    raw = ""
+    try:
+        raw = request.get_data(as_text=True) or ""
+    except Exception:
+        pass
+    logger.info("=" * 70)
+    logger.info(f"🔬 /webhook_raw ({len(raw)} байт):")
+    logger.info(raw[:3000])
+    logger.info("=" * 70)
+    RECENT_WEBHOOKS.append({
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "raw": raw[:3000],
+        "headers": dict(request.headers),
+        "endpoint": "raw",
+    })
+    return jsonify({"ok": True}), 200
+
+
+@app.route("/pending_webhooks")
+def pending_webhooks():
+    """Показывает последние 50 входящих вебхуков через веб-интерфейс."""
+    items = list(RECENT_WEBHOOKS)
+    items.reverse()  # свежие сверху
+
+    rows = ""
+    for it in items:
+        rows += f"""
+        <div style="border:1px solid #ddd;padding:10px;margin:8px 0;border-radius:5px;background:#fff">
+            <div style="color:#888;font-size:12px">{it['ts']} — {it.get('endpoint','webhook')}</div>
+            <pre style="background:#1e1e1e;color:#d4d4d4;padding:10px;border-radius:4px;
+                        font-size:11px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;
+                        max-height:300px;overflow-y:auto;margin:6px 0">{it['raw']}</pre>
+        </div>
+        """
+    if not rows:
+        rows = '<div style="padding:20px;text-align:center;color:#999">Пока ничего не приходило</div>'
+
+    return f"""
+    <!DOCTYPE html><html><head><meta charset="UTF-8">
+    <title>Pending webhooks</title>
+    <meta http-equiv="refresh" content="10">
+    <style>
+        body {{font-family:Arial;max-width:1100px;margin:30px auto;padding:20px;background:#f5f5f5}}
+        .card {{background:white;padding:20px;border-radius:8px;margin-bottom:20px;
+                box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
+        a {{color:#007bff;text-decoration:none}}
+        .btn {{display:inline-block;padding:10px 18px;background:#007bff;color:white;
+               border-radius:5px;text-decoration:none;margin-right:8px}}
+    </style>
+    </head><body>
+    <div class="card">
+        <h1>🔔 Последние 50 входящих вебхуков</h1>
+        <p>Автообновление каждые 10 секунд. Всего в буфере: {len(items)}</p>
+        <a href="/pending_webhooks" class="btn">🔄 Обновить</a>
+        <a href="/admin" class="btn">⚙️ Админка</a>
+        <a href="/webhook_test" class="btn">🧪 Webhook test</a>
+        <a href="/setup_webhook" class="btn">🔗 Перерегистрировать</a>
+    </div>
+    <div class="card">{rows}</div>
+    </body></html>
+    """
+
+
+@app.route("/webhook_test", methods=["GET"])
+def webhook_test():
+    """Проверка: работает ли эндпоинт вебхука в принципе."""
+    return jsonify({
+        "status": "ok",
+        "recent_count": len(RECENT_WEBHOOKS),
+        "recent_keys": [
+            {"ts": it["ts"], "size": len(it["raw"])} for it in list(RECENT_WEBHOOKS)[-10:]
+        ],
+        "sources": sorted(SOURCE_CHAT_IDS),
+        "target": TARGET_CHANNEL_ID,
+    })
 
 
 # ============================================================
@@ -310,11 +448,21 @@ def admin_cleanup_history():
 
 @app.route("/setup_webhook")
 def setup_webhook():
-    webhook_url = f"{PUBLIC_URL}/webhook"
+    """
+    Перерегистрация вебхука.
+    По умолчанию — на /webhook.
+    Можно передать ?target=raw — тогда на /webhook_raw (для диагностики).
+    """
+    target = request.args.get("target", "webhook")
+    if target == "raw":
+        webhook_url = f"{PUBLIC_URL}/webhook_raw"
+    else:
+        webhook_url = f"{PUBLIC_URL}/webhook"
+
     ok = api.setup_webhook(webhook_url)
     if ok:
-        return redirect("/admin")
-    return "❌ Не удалось настроить вебхук. Проверь логи.", 500
+        return redirect("/pending_webhooks")
+    return f"❌ Не удалось настроить вебхук на {webhook_url}. Проверь логи.", 500
 
 
 # ============================================================
@@ -338,7 +486,7 @@ def debug_page():
     <title>Debug</title>
     <style>body{{font-family:Arial;max-width:800px;margin:30px auto;padding:20px;background:#f5f5f5}}
     .card{{background:white;padding:20px;border-radius:8px;margin-bottom:20px;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
-    .btn{{display:inline-block;padding:10px 18px;background:#007bff;color:white;border-radius:5px;text-decoration:none;margin-right:8px}}
+    .btn{{display:inline-block;padding:10px 18px;background:#007bff;color:white;border-radius:5px;text-decoration:none;margin-right:8px;margin-bottom:8px}}
     code{{background:#f0f0f0;padding:2px 6px;border-radius:3px}}</style>
     </head><body>
     <div class="card">
@@ -348,10 +496,11 @@ def debug_page():
         <p>Всего пересылок: <b>{stats['total']}</b></p>
         <p>Успешных: <b>{stats['success']}</b>, ошибок: <b>{stats['errors']}</b></p>
         <p>В очереди: <b>{queue.q.qsize()}</b></p>
+        <p>Вебхуков в буфере: <b>{len(RECENT_WEBHOOKS)}</b></p>
         <a href="/admin" class="btn">⚙️ Админка</a>
+        <a href="/pending_webhooks" class="btn">🔔 Вебхуки</a>
+        <a href="/webhook_test" class="btn">🧪 Webhook test</a>
         <a href="/setup_webhook" class="btn">🔗 Вебхук</a>
-        <a href="/test_subs" class="btn">📋 Подписки</a>
-        <a href="/test_me" class="btn">🤖 Мой бот</a>
         <a href="/debug" class="btn">🔄 Обновить</a>
     </div>
     </body></html>
@@ -368,23 +517,8 @@ def health():
         "target": TARGET_CHANNEL_ID,
         "queue": queue.q.qsize(),
         "stats": stats,
+        "recent_webhooks": len(RECENT_WEBHOOKS),
     }
-
-
-# ============================================================
-# ОТЛАДКА: подписки и инфо о боте
-# ============================================================
-
-@app.route("/test_subs")
-def test_subs():
-    """Сырой ответ MAX на GET /subscriptions."""
-    return jsonify(api.get_subscriptions_raw())
-
-
-@app.route("/test_me")
-def test_me():
-    """Сырой ответ MAX на GET /me."""
-    return jsonify(api.get_me_raw())
 
 
 # ============================================================
@@ -400,7 +534,10 @@ if __name__ == "__main__":
     logger.info(f"   Фильтров: {len(TRIGGER_PHRASES)}")
     logger.info(f"   Админ: {ADMIN_USER}, пароль: {'✅' if ADMIN_PASS else '❌'}")
 
-    # Автоперерегистрация вебхука при старте ОТКЛЮЧЕНА —
-    # чтобы не создавать гонки. Регистрируйте вручную через /setup_webhook.
+    if TOKEN:
+        try:
+            api.setup_webhook(f"{PUBLIC_URL}/webhook")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось настроить вебхук при старте: {e}")
 
     app.run(host="0.0.0.0", port=port, threaded=True)
