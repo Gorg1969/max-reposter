@@ -51,3 +51,19 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "")  # если пусто — авт�
 
 # ============ ЛОГИРОВАНИЕ ============
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+
+# ============ ХЕЛПЕР ДЛЯ СРАВНЕНИЯ chat_id ============
+def _norm(chat_id) -> str:
+    """Нормализует chat_id: убирает минус, приводит к строке."""
+    return str(chat_id).lstrip("-")
+
+def is_source_chat(chat_id) -> bool:
+    """Проверяет, является ли chat_id одним из источников (с учётом знака)."""
+    if chat_id is None:
+        return False
+    s = str(chat_id)
+    # Прямое сравнение
+    if s in SOURCE_CHAT_IDS:
+        return True
+    # Сравнение без минуса
+    return _norm(s) in {_norm(c) for c in SOURCE_CHAT_IDS}
